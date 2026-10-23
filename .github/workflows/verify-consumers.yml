@@ -88,7 +88,13 @@ jobs:
           mkdir -p libs
           python3 dnix/verify/extract_symbols.py pkg ${{ matrix.package.bindings }} > libs/symbols.txt
           find -L pkg/result -path '*x86_64-pc-windows-*' -name '${{ matrix.package.library }}.dll' -exec cp {} libs/ \;
-          ls -la libs
+          for pair in x86_64:x86_64-linux-android arm64-v8a:aarch64-linux-android armeabi-v7a:armv7-linux-androideabi; do
+            abi=${pair%%:*}; target=${pair#*:}
+            if [ -e "pkg/result/$target/lib${{ matrix.package.library }}.so" ]; then
+              mkdir -p "libs/android/$abi" && cp "pkg/result/$target/lib${{ matrix.package.library }}.so" "libs/android/$abi/"
+            fi
+          done
+          find libs -type f | sort
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.host == 'ubuntu-24.04' }}
         with: { name: 'libs-${{ matrix.package.name }}', path: libs, retention-days: 3 }
@@ -160,78 +166,62 @@ jobs:
           "::notice title=Windows ${{ matrix.package }}::$(($output | Select-Object -Last 1) -join ' ')"
 
   android:
-    name: Android emulator, ${{ matrix.package.name }}
+    name: Android emulator, ${{ matrix.package }}
+    needs: build
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        package:
-          - { name: tor, repo: slopbot9k/tor, ref: dnix, library: tor_ffi_plugin, bindings: lib/tor_ffi_plugin_bindings_generated.dart }
-          - { name: flutter_libmwc, repo: slopbot9k/flutter_libepiccash, ref: mwc-dnix, library: mwc_wallet, bindings: lib/mwc.dart }
-          - { name: frostdart, repo: slopbot9k/frostdart, ref: dnix, library: hrf_api, bindings: lib/frostdart_bindings_generated.dart }
-          - { name: flutter_libepiccash, repo: slopbot9k/flutter_libepiccash, ref: dnix, library: epic_cash_wallet, bindings: lib/src/epic_cash_wallet_bindings.g.dart }
+        include:
+          - { package: tor, library: tor_ffi_plugin }
+          - { package: flutter_libmwc, library: mwc_wallet }
+          - { package: frostdart, library: hrf_api }
+          - { package: flutter_libepiccash, library: epic_cash_wallet }
     steps:
-      - name: Free disk space
-        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL && df -h /
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: { path: dnix, persist-credentials: false }
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with: { repository: '${{ matrix.package.repo }}', ref: '${{ matrix.package.ref }}', path: pkg, persist-credentials: false }
-      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
-      - name: Route epiccash's dependency branches to slopbot9k's forks
-        if: matrix.package.name == 'flutter_libepiccash'
-        working-directory: pkg
-        run: |
-          . ../dnix/verify/run_logged.sh
-          git config --global url.https://github.com/slopbot9k/epic.git.insteadOf https://github.com/cypherstack/epic.git
-          git config --global url.https://github.com/slopbot9k/randomx-rust.insteadOf https://github.com/cypherstack/randomx-rust
-          rev=$(grep -o 'randomx-rust?branch=[^#]*#[0-9a-f]*' rust/Cargo.lock | cut -d'#' -f2)
-          hash=$(jq -r '.rust.outputHashes["randomx-0.2.0"]' dnix.json)
-          logged "Prefetch randomx-rust" nix build --impure --no-link -L --expr "let pkgs = (builtins.getFlake (toString ./.)).inputs.dnix.inputs.nixpkgs.legacyPackages.\${builtins.currentSystem}; in pkgs.fetchgit { url = \"https://github.com/slopbot9k/randomx-rust\"; rev = \"$rev\"; sha256 = \"$hash\"; }"
-      # The hook builds through the package's flake; point it at the dnix
-      # under test, and use dev mode, which builds without checking the lock.
-      - name: Use the dnix under test in dev mode
-        working-directory: pkg
-        run: |
-          nix flake lock --override-input dnix "github:slopbot9k/dnix/$DNIX_REV"
-          echo dev > .dnix-build
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with: { name: 'libs-${{ matrix.package }}', path: libs }
       - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with: { flutter-version: 3.47.2, channel: stable, cache: true }
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with: { distribution: temurin, java-version: '17' }
       - name: Enable KVM for the emulator
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
-        with: { distribution: temurin, java-version: '17' }
-      - name: Add the integration test to the example app
-        working-directory: pkg/example
+      # A bare app whose jniLibs hold exactly the libraries the Linux x64
+      # host built, so the emulator runs those bytes.
+      - name: Make a bare app holding the built libraries
         run: |
-          mkdir -p integration_test
-          cp ../../dnix/verify/integration/ffi_test.dart ../../dnix/verify/integration/checks.dart integration_test/
-          cp ../../dnix/verify/integration/calls/${{ matrix.package.name }}.dart integration_test/calls.dart
+          flutter create --platforms android --project-name ffi_check_app app
+          cp -R libs/android app/android/app/src/main/jniLibs
+          find app/android/app/src/main/jniLibs -type f
+          cd app
           flutter pub add 'dev:integration_test:{"sdk":"flutter"}'
-          flutter pub add ffi
+          flutter pub add 'ffi_check:{"path":"../dnix/verify/ffi_check"}'
+          mkdir -p integration_test && cp ../dnix/verify/android_app/check_test.dart integration_test/
           printf '\norg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g\n' >> android/gradle.properties
-          python3 ../../dnix/verify/extract_symbols.py .. ${{ matrix.package.bindings }} > ../../symbols.txt
-          echo "SYMBOLS=$(paste -sd, ../../symbols.txt)" >> "$GITHUB_ENV"
-      - name: Load and call the Android library in the example app on an emulator
+          echo "SYMBOLS=$(paste -sd, ../libs/symbols.txt)" >> "$GITHUB_ENV"
+      - name: Load and call the Android library on an emulator
         uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         with:
           api-level: 34
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: cd pkg/example && flutter test integration_test/ffi_test.dart -d emulator-5554 --dart-define=PACKAGE=${{ matrix.package.name }} --dart-define=LIBRARY=${{ matrix.package.library }} --dart-define=SYMBOLS=${{ env.SYMBOLS }} > ../../android.log 2>&1
+          script: cd app && flutter test integration_test/check_test.dart -d emulator-5554 --dart-define=PACKAGE=${{ matrix.package }} --dart-define=LIBRARY=${{ matrix.library }} --dart-define=SYMBOLS=${{ env.SYMBOLS }} > ../android.log 2>&1
       - name: Report the emulator run
         if: ${{ always() }}
         run: |
-          [ -f android.log ] || { echo "::error title=Android ${{ matrix.package.name }}::no log; the emulator step failed before the test ran"; exit 1; }
+          [ -f android.log ] || { echo "::error title=Android ${{ matrix.package }}::no log; the emulator step failed before the test ran"; exit 1; }
           tail -n 80 android.log
           if grep -q 'All tests passed' android.log; then
-            echo "::notice title=Android ${{ matrix.package.name }}::$(grep -E 'declared symbols|via the bindings|All tests passed' android.log | tr '\n' ' ' | cut -c1-900)"
+            echo "::notice title=Android ${{ matrix.package }}::$(grep -E 'declared symbols|words|answered|round-trip|tor_hello|All tests passed' android.log | tr '\n' ' ' | cut -c1-900)"
           else
-            echo "::error title=Android ${{ matrix.package.name }}::$(grep -v -E '^\s*$' android.log | tail -c 2500 | tr '\n' ' ')"
+            echo "::error title=Android ${{ matrix.package }}::$(grep -n -i -E 'FAIL|error|exception|could not|unable' android.log | tail -n 25 | tr '\n' ' ' | cut -c1-3000)"
             exit 1
           fi
