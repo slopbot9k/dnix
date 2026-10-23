@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RELEASE_PREFIX: sort
+  RELEASE_PREFIX: final
 
 jobs:
   android:
