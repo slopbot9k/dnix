@@ -14,8 +14,9 @@ while pos + 60 <= len(data):
     elif name == "//":                               # GNU long-name table
         longnames = body; continue
     elif name.startswith("/") and name[1:].isdigit():  # GNU long name
-        off = int(name[1:]); end = longnames.index(b"/\n", off) if b"/\n" in longnames[off:] else longnames.index(b"\n", off)
-        name = longnames[off:end].decode("latin1")
+        off = int(name[1:])  # entries end in "/\n" (GNU) or a NUL (MSVC)
+        ends = [i for i in (longnames.find(b"/\n", off), longnames.find(b"\0", off), longnames.find(b"\n", off)) if i >= 0]
+        name = longnames[off:min(ends) if ends else len(longnames)].decode("latin1")
     if name in ("/", "/SYM64/", "__.SYMDEF", "__.SYMDEF SORTED", "/<ECSYMBOLS>/"):
         name = "<symbol table " + name + ">"
     name = name.rstrip("/")
