@@ -90,7 +90,7 @@ jobs:
           gh release create "$tag" --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" --title "Temporary: Android emulator log of ${{ matrix.package.name }}" --notes "Diagnostics; deleted after the check." android.log libs/SHA256SUMS
           summary=$(grep -a 'FFI-CHECK\|tests passed\|test passed\|tests failed\|Some tests failed' android.log | tr -d '\r' | tr -c '[:print:]\n' ' ' | sed 's/::/: :/g' | tr '\n' ' ' | cut -c1-2500)
           # Flutter's reporters end with "All tests passed!" or "N test(s) passed."
-          if grep -aqE 'All tests passed|[0-9]+ tests? passed' android.log && ! grep -aqE 'tests? failed|Some tests failed' android.log; then
+          if grep -aqE 'All tests passed|[1-9][0-9]* tests? passed\.' android.log && ! grep -aqE '[1-9][0-9]* failed|Some tests failed' android.log; then
             echo "::notice title=Android ${{ matrix.package.name }}::$summary"
           else
             echo "::error title=Android ${{ matrix.package.name }}::emulator step ${{ steps.emulator.outcome }}; $summary"
