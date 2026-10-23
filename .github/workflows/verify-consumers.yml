@@ -6,17 +6,18 @@ name: Verify consumers
 
 on:
   push:
-    branches: [verify-consumers]
+    branches: [verify-stable-sort]
 
 permissions:
   contents: read
 
 concurrency:
-  group: verify-consumers
+  group: verify-stable-sort
   cancel-in-progress: true
 
 env:
-  DNIX_REV: eb0dac1755b7a4051cf0023a3fae0c393f2d9df6
+  DNIX_REV: 8aa81f3644a1367f2b1b84be30c895e478e9fada
+  DNIX_TRACE_REV: 83993914e139bec74403db015688b08ec9724d8f
 
 jobs:
   build:
@@ -79,7 +80,7 @@ jobs:
               esac
             done
           done
-          tag="verify-${{ matrix.package.name }}-${{ matrix.host }}"
+          tag="sort-${{ matrix.package.name }}-${{ matrix.host }}"
           gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$tag" --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" --title "Temporary: ${{ matrix.package.name }} built on ${{ matrix.host }}" --notes "Build output for comparing hosts; deleted after the comparison." publish/*
       - name: Collect the Windows library and symbols
@@ -111,6 +112,66 @@ jobs:
           python3 dnix/verify/extract_symbols.py pkg ${{ matrix.package.bindings }} > symbols.txt
           cd dnix/verify/ffi_check && dart pub get
           logged "FFI ${{ matrix.package.name }} $triple" dart run bin/ffi_check.dart ${{ matrix.package.name }} "$library" ../../../symbols.txt
+
+  # Builds every target again with a dnix that loads a tracing qsort into
+  # every build tool, to find the tools whose output could depend on the
+  # host's sort, and keeps randomx's intermediate files.
+  trace:
+    name: Trace ${{ matrix.host }}, ${{ matrix.package.name }}
+    runs-on: ${{ matrix.host }}
+    timeout-minutes: 330
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        host: [ubuntu-24.04, macos-15]
+        package:
+          - { name: tor, repo: slopbot9k/tor, ref: dnix }
+          - { name: flutter_libmwc, repo: slopbot9k/flutter_libepiccash, ref: mwc-dnix }
+          - { name: frostdart, repo: slopbot9k/frostdart, ref: dnix }
+          - { name: flutter_libepiccash, repo: slopbot9k/flutter_libepiccash, ref: dnix }
+    steps:
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        run: sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL && df -h /
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { path: dnix, persist-credentials: false }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: '${{ matrix.package.repo }}', ref: '${{ matrix.package.ref }}', path: pkg, persist-credentials: false }
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+      - name: Route epiccash's dependency branches to slopbot9k's forks
+        if: matrix.package.name == 'flutter_libepiccash'
+        working-directory: pkg
+        run: |
+          . ../dnix/verify/run_logged.sh
+          git config --global url.https://github.com/slopbot9k/epic.git.insteadOf https://github.com/cypherstack/epic.git
+          git config --global url.https://github.com/slopbot9k/randomx-rust.insteadOf https://github.com/cypherstack/randomx-rust
+          rev=$(grep -o 'randomx-rust?branch=[^#]*#[0-9a-f]*' rust/Cargo.lock | cut -d'#' -f2)
+          hash=$(jq -r '.rust.outputHashes["randomx-0.2.0"]' dnix.json)
+          logged "Prefetch randomx-rust" nix build --impure --no-link -L --expr "let pkgs = (builtins.getFlake (toString ./.)).inputs.dnix.inputs.nixpkgs.legacyPackages.\${builtins.currentSystem}; in pkgs.fetchgit { url = \"https://github.com/slopbot9k/randomx-rust\"; rev = \"$rev\"; sha256 = \"$hash\"; }"
+      - name: Build every target with the tracing qsort
+        working-directory: pkg
+        run: |
+          . ../dnix/verify/run_logged.sh
+          system=$(nix eval --impure --raw --expr builtins.currentSystem)
+          targets=$(nix eval --override-input dnix "github:slopbot9k/dnix/$DNIX_TRACE_REV" --json ".#packages.$system" --apply 'p: builtins.filter (n: !(builtins.elem n [ "all" "vendor" "default" ])) (builtins.attrNames p)' | jq -r '.[]')
+          mkdir -p ../trace
+          for target in $targets; do
+            logged "Trace ${{ matrix.package.name }} $target on ${{ matrix.host }}" nix build ".#$target" --override-input dnix "github:slopbot9k/dnix/$DNIX_TRACE_REV" -L --out-link "../trace/trace-$target"
+          done
+      - name: Summarize and publish the traces
+        if: ${{ !cancelled() }}
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          python3 dnix/verify/trace_summary.py trace/trace-* | tee summary.txt
+          (cd trace && for d in trace-*; do for f in "$d"/lib/*; do [ -f "$f" ] && echo "$(shasum -a 256 "$f" | cut -d' ' -f1)  ${d#trace-}/$(basename "$f")"; done; done) | tee SHA256SUMS
+          mkdir -p debug && for d in trace/trace-*; do mkdir -p "debug/${d#trace/trace-}" && cp -R "$d/debug/." "debug/${d#trace/trace-}/"; done
+          tar -czf debug.tar.gz debug
+          echo "::notice title=Trace ${{ matrix.package.name }} ${{ matrix.host }}::$(awk 'NR>1 && $4>0 {printf "%s %s: %s calls with ties; ", $1, $2, $4}' summary.txt | cut -c1-3500)"
+          tag="trace-${{ matrix.package.name }}-${{ matrix.host }}"
+          gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" --title "Temporary: qsort trace of ${{ matrix.package.name }} on ${{ matrix.host }}" --notes "Diagnostics; deleted after the comparison." summary.txt SHA256SUMS debug.tar.gz
 
   compare:
     name: Compare the hosts
