@@ -77,7 +77,7 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: cd app && flutter test integration_test/check_test.dart -d emulator-5554 --dart-define=PACKAGE=${{ matrix.package.name }} --dart-define=LIBRARY=${{ matrix.package.library }} --dart-define=SYMBOLS=${{ env.SYMBOLS }} > ../android.log 2>&1
+          script: cd app && flutter test integration_test/check_test.dart -d emulator-5554 --reporter expanded --dart-define=PACKAGE=${{ matrix.package.name }} --dart-define=LIBRARY=${{ matrix.package.library }} --dart-define=SYMBOLS=${{ env.SYMBOLS }} > ../android.log 2>&1
       - name: Publish the emulator log and report
         if: ${{ always() }}
         env: { GH_TOKEN: '${{ github.token }}' }
@@ -88,8 +88,9 @@ jobs:
           tag="android-${{ matrix.package.name }}"
           gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null
           gh release create "$tag" --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" --title "Temporary: Android emulator log of ${{ matrix.package.name }}" --notes "Diagnostics; deleted after the check." android.log libs/SHA256SUMS
-          summary=$(grep -a 'FFI-CHECK\|All tests passed\|Some tests failed' android.log | tr -d '\r' | tr -c '[:print:]\n' ' ' | sed 's/::/: :/g' | tr '\n' ' ' | cut -c1-2500)
-          if grep -aq 'All tests passed' android.log; then
+          summary=$(grep -a 'FFI-CHECK\|tests passed\|test passed\|tests failed\|Some tests failed' android.log | tr -d '\r' | tr -c '[:print:]\n' ' ' | sed 's/::/: :/g' | tr '\n' ' ' | cut -c1-2500)
+          # Flutter's reporters end with "All tests passed!" or "N test(s) passed."
+          if grep -aqE 'All tests passed|[0-9]+ tests? passed' android.log && ! grep -aqE 'tests? failed|Some tests failed' android.log; then
             echo "::notice title=Android ${{ matrix.package.name }}::$summary"
           else
             echo "::error title=Android ${{ matrix.package.name }}::emulator step ${{ steps.emulator.outcome }}; $summary"
