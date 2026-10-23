@@ -1,0 +1,97 @@
+# Temporary: loads each package's Linux-built Android libraries in a bare
+# Flutter app on an emulator and calls them through Dart FFI. The libraries
+# come from the releases a verification run published.
+name: Verify Android
+
+on:
+  push:
+    branches: [verify-android]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-android
+  cancel-in-progress: true
+
+env:
+  RELEASE_PREFIX: sort
+
+jobs:
+  android:
+    name: Android emulator, ${{ matrix.package.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - { name: tor, repo: slopbot9k/tor, ref: dnix, library: tor_ffi_plugin, bindings: lib/tor_ffi_plugin_bindings_generated.dart }
+          - { name: flutter_libmwc, repo: slopbot9k/flutter_libepiccash, ref: mwc-dnix, library: mwc_wallet, bindings: lib/mwc.dart }
+          - { name: frostdart, repo: slopbot9k/frostdart, ref: dnix, library: hrf_api, bindings: lib/frostdart_bindings_generated.dart }
+          - { name: flutter_libepiccash, repo: slopbot9k/flutter_libepiccash, ref: dnix, library: epic_cash_wallet, bindings: lib/src/epic_cash_wallet_bindings.g.dart }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { path: dnix, persist-credentials: false }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { repository: '${{ matrix.package.repo }}', ref: '${{ matrix.package.ref }}', path: pkg, persist-credentials: false }
+      - name: Fetch the Linux-built Android libraries
+        run: |
+          release="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_PREFIX-${{ matrix.package.name }}-ubuntu-24.04"
+          for pair in x86_64:x86_64-linux-android arm64-v8a:aarch64-linux-android armeabi-v7a:armv7-linux-androideabi; do
+            abi=${pair%%:*}; target=${pair#*:}
+            mkdir -p "libs/android/$abi"
+            curl -sfL -o "libs/android/$abi/lib${{ matrix.package.library }}.so" "$release/${target}__lib${{ matrix.package.library }}.so"
+          done
+          curl -sfL -o libs/SHA256SUMS "$release/SHA256SUMS"
+          (cd libs/android && sha256sum */*.so)
+          python3 dnix/verify/extract_symbols.py pkg ${{ matrix.package.bindings }} > libs/symbols.txt
+          wc -l libs/symbols.txt
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
+        with: { flutter-version: 3.47.2, channel: stable, cache: true }
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with: { distribution: temurin, java-version: '17' }
+      - name: Enable KVM for the emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Make a bare app holding the built libraries
+        run: |
+          flutter create --platforms android --project-name ffi_check_app app
+          cp -R libs/android app/android/app/src/main/jniLibs
+          find app/android/app/src/main/jniLibs -type f
+          cd app
+          flutter pub add 'dev:integration_test:{"sdk":"flutter"}'
+          flutter pub add 'ffi_check:{"path":"../dnix/verify/ffi_check"}'
+          mkdir -p integration_test && cp ../dnix/verify/android_app/check_test.dart integration_test/
+          printf '\norg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g\n' >> android/gradle.properties
+          echo "SYMBOLS=$(paste -sd, ../libs/symbols.txt)" >> "$GITHUB_ENV"
+      - name: Load and call the Android library on an emulator
+        id: emulator
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: cd app && flutter test integration_test/check_test.dart -d emulator-5554 --dart-define=PACKAGE=${{ matrix.package.name }} --dart-define=LIBRARY=${{ matrix.package.library }} --dart-define=SYMBOLS=${{ env.SYMBOLS }} > ../android.log 2>&1
+      - name: Publish the emulator log and report
+        if: ${{ always() }}
+        env: { GH_TOKEN: '${{ github.token }}' }
+        run: |
+          set +e
+          ls -la
+          [ -f android.log ] || echo "no android.log was written" > android.log
+          tag="android-${{ matrix.package.name }}"
+          gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null
+          gh release create "$tag" --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" --title "Temporary: Android emulator log of ${{ matrix.package.name }}" --notes "Diagnostics; deleted after the check." android.log libs/SHA256SUMS
+          summary=$(grep -a 'FFI-CHECK\|All tests passed\|Some tests failed' android.log | tr -d '\r' | tr -c '[:print:]\n' ' ' | sed 's/::/: :/g' | tr '\n' ' ' | cut -c1-2500)
+          if grep -aq 'All tests passed' android.log; then
+            echo "::notice title=Android ${{ matrix.package.name }}::$summary"
+          else
+            echo "::error title=Android ${{ matrix.package.name }}::emulator step ${{ steps.emulator.outcome }}; $summary"
+            exit 1
+          fi
