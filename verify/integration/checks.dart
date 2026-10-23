@@ -100,6 +100,9 @@ void checkOpenWalletError(DynamicLibrary library, String name, String free) {
   if (pointer == nullptr) fail('$name returned null');
   final message = pointer.toDartString();
   library.lookupFunction<FreeNative, FreeDart>(free)(pointer);
+  if (!message.startsWith('Error')) {
+    fail('$name({}) did not report an error: $message');
+  }
   print(
       '$name({}) answered: ${message.length > 80 ? '${message.substring(0, 80)}…' : message}');
 }
