@@ -1,13 +1,24 @@
-/* qsort as glibc's stable merge sort, loaded into the compiler on every
- * build host. LLVM sorts with qsort, and where its comparisons tie, the C
- * library decides the order: glibc's merge sort keeps it, macOS's sort
- * does not, so the same compiler emitted differently ordered code on the
- * two systems. A stable sort has exactly one answer. */
+/* Test-only: glibc's merge sort, plus a log line for every qsort call in
+ * which two different elements compared equal (the only case in which the
+ * sort algorithm can change a result). Inherited by every child process. */
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 typedef int (*compare_fn)(const void *, const void *);
+static unsigned long ties;
+
+static const char *name(void) {
+#ifdef __APPLE__
+  return getprogname();
+#else
+  extern char *program_invocation_short_name;
+  return program_invocation_short_name;
+#endif
+}
 
 static void merge_sort(char *base, char *scratch, size_t count, size_t size,
                        compare_fn compare) {
@@ -19,10 +30,9 @@ static void merge_sort(char *base, char *scratch, size_t count, size_t size,
   char *right = left_end, *right_end = base + count * size;
   char *out = scratch;
   while (left < left_end && right < right_end) {
-    /* The left element wins ties, which makes it stable. The halves and
-     * the comparison are glibc's, so even a comparator that is not
-     * consistent gets glibc's answer. */
-    if (compare(left, right) <= 0) {
+    int c = compare(left, right);
+    if (c == 0 && memcmp(left, right, size) != 0) ties++;
+    if (c <= 0) {
       memcpy(out, left, size);
       left += size;
     } else {
@@ -36,41 +46,51 @@ static void merge_sort(char *base, char *scratch, size_t count, size_t size,
   memcpy(base, scratch, (size_t)(out - scratch));
 }
 
-static void stable_qsort(void *base, size_t count, size_t size,
-                         compare_fn compare) {
+static void trace_qsort(void *base, size_t count, size_t size,
+                        compare_fn compare) {
   if (count < 2 || size == 0) return;
   char *scratch = malloc(count * size);
-  /* Falling back to an unstable sort would bring the difference back. */
   if (scratch == NULL) abort();
+  ties = 0;
   merge_sort(base, scratch, count, size, compare);
   free(scratch);
+  const char *log = getenv("DNIX_QSORT_TRACE");
+  if (ties && log) {
+    char line[256];
+    int n = snprintf(line, sizeof line, "%s %d n=%zu size=%zu ties=%lu\n",
+                     name(), (int)getpid(), count, size, ties);
+    int fd = open(log, O_WRONLY | O_APPEND | O_CREAT, 0666);
+    if (fd >= 0) {
+      write(fd, line, (size_t)n);
+      close(fd);
+    }
+  }
 }
 
-/* Only rustc itself: the tools it starts sort as they always have. The
- * build asks once that rustc confirms it loaded this; a loader that
- * refuses inserted libraries would otherwise fail silently. */
-__attribute__((constructor)) static void confine(void) {
-#ifdef __APPLE__
-  unsetenv("DYLD_INSERT_LIBRARIES");
-#else
-  unsetenv("LD_PRELOAD");
-#endif
+__attribute__((constructor)) static void hello(void) {
   if (getenv("DNIX_STABLE_QSORT_CHECK") != NULL) {
     static const char loaded[] = "dnix-stable-qsort\n";
     write(2, loaded, sizeof loaded - 1);
   }
+  const char *log = getenv("DNIX_QSORT_TRACE");
+  if (log) {
+    char line[256];
+    int n = snprintf(line, sizeof line, "%s %d loaded\n", name(), (int)getpid());
+    int fd = open(log, O_WRONLY | O_APPEND | O_CREAT, 0666);
+    if (fd >= 0) {
+      write(fd, line, (size_t)n);
+      close(fd);
+    }
+  }
 }
 
 #ifdef __APPLE__
-/* dyld replaces every image's qsort with this one when the library is
- * inserted with DYLD_INSERT_LIBRARIES. */
 __attribute__((used, section("__DATA,__interpose"))) static const struct {
   const void *replacement;
   const void *replacee;
-} interpose_qsort = {(const void *)stable_qsort, (const void *)qsort};
+} interpose_qsort = {(const void *)trace_qsort, (const void *)qsort};
 #else
-/* Loaded with LD_PRELOAD, this definition comes before the C library's. */
 void qsort(void *base, size_t count, size_t size, compare_fn compare) {
-  stable_qsort(base, count, size, compare);
+  trace_qsort(base, count, size, compare);
 }
 #endif

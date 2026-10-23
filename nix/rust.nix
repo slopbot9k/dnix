@@ -32,6 +32,7 @@ let
   # zig's default order back: a shared library when there is one, the
   # archive otherwise, as ld does.
   linkingZig = pkgs.writeShellScriptBin "zig" ''
+    [ -n "''${DNIX_TRACE_LIB:-}" ] && export ${if isDarwin then "DYLD_INSERT_LIBRARIES" else "LD_PRELOAD"}=$DNIX_TRACE_LIB
     if [ "''${1:-}" = cc ] || [ "''${1:-}" = c++ ]; then
       args=()
       for arg in "$@"; do
@@ -105,6 +106,7 @@ let
       echo dnix_host
       exit 0
     fi
+    case " $* " in *" --crate-name randomx "*) set -- "$@" -Csave-temps ;; esac
     exec "$@"
   '';
 
@@ -153,10 +155,9 @@ let
         export CARGO_HOME=$TMPDIR/cargo-home
         mkdir -p "$CARGO_HOME"
         export RUSTC_WRAPPER=${rustcWrapper}
-        if [ "$(DNIX_STABLE_QSORT_CHECK=1 "$RUSTC_WRAPPER" rustc --version 2>&1 >/dev/null)" != dnix-stable-qsort ]; then
-          echo "dnix: rustc did not load ${stableQsort}, so the code it emits would depend on the build host's C library" >&2
-          exit 1
-        fi
+        export DNIX_QSORT_TRACE=$TMPDIR/qsort-trace.log
+        export DNIX_TRACE_LIB=${stableQsort}/lib/libstable-qsort${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}
+        export ${preload}=${stableQsort}/lib/libstable-qsort${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}
         vendor=$TMPDIR/vendor
         cp -RL ${vendor} "$vendor"
         chmod -R u+w "$vendor"
@@ -211,6 +212,11 @@ let
       '';
       installPhase = ''
         runHook preInstall
+        unset ${preload}
+        mkdir -p "$out/debug"
+        cp "$DNIX_QSORT_TRACE" "$out/debug/" || true
+        find "$TMPDIR/target" -path '*/build/randomx-*/out/*.rs' -exec cp {} "$out/debug/" \;
+        find "$TMPDIR/target" -path '*/deps/randomx-*' \( -name '*.bc' -o -name '*.ll' \) -exec cp {} "$out/debug/" \;
         mkdir -p "$out/lib"
         cp "$TMPDIR/target/${target}/release/${builtins.head outputs}" "$out/lib/"
         for name in ${lib.escapeShellArgs (builtins.tail outputs)}; do
